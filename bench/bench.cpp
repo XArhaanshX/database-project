@@ -192,6 +192,13 @@ int main(int argc, char** argv) {
   };
   const auto all = variants();
 
+  // Untimed warm-up so the first workload is not measured while the CPU is
+  // still ramping its clock.
+  for (int i = 0; i < 3; ++i) {
+    BPlusTree t;
+    for (Key k : workloads[1].keys) t.insert(k, k);
+  }
+
   // 1. Every variant on every workload.
   std::FILE* f = std::fopen((out + "/main.csv").c_str(), "w");
   if (!f) {
