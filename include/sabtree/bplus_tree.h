@@ -425,12 +425,14 @@ class BPlusTree {
         break;
       case SplitPolicy::Adaptive:
         if (nd.run >= opts_.run_threshold) {
-          // Keep the new key on the left, so the run keeps appending to a node
-          // that holds only its own keys and whatever followed it moves out.
-          // For a pure append this leaves the left node completely full.
+          // Keys after the run belong to someone else (the next stream's
+          // range): cut right after the new key so they move out and the run
+          // keeps appending to a node holding only its own keys.
+          if (pos + 1 < n) return clamp(pos + 1);
+          // Pure append: keep seq_fill of a page on the left, leaving room
+          // for late keys, and start the right node with the remainder.
           auto cap = leaf ? opts_.leaf_capacity : opts_.inner_capacity;
-          auto limit = std::max(1u, static_cast<std::uint32_t>(opts_.seq_fill * cap));
-          return clamp(std::min(pos + 1, limit));
+          return clamp(std::max(1u, static_cast<std::uint32_t>(opts_.seq_fill * cap)));
         }
         break;
     }
