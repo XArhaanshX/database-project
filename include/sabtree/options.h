@@ -47,7 +47,7 @@ struct Options {
   double seq_fill = 0.9;
 
   HintPolicy hints = HintPolicy::None;
-  // Multi hints: number of cached leaves (about 24 bytes each). Rightmost
+  // Multi hints: number of cached leaves (28 bytes each). Rightmost
   // always uses one.
   std::uint32_t hint_slots = 64;
 };
