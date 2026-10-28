@@ -23,6 +23,13 @@ enum class SplitPolicy {
                 // `run_threshold` adjacent inserts has been seen (ours)
 };
 
+// Which leaves an insert may jump to directly, skipping the descent.
+enum class HintPolicy {
+  None,       // always descend from the root
+  Rightmost,  // cache only the rightmost leaf (PostgreSQL's nbtree fastpath)
+  Multi,      // LRU cache of recently written leaves with their fence keys (ours)
+};
+
 struct Options {
   // Maximum number of keys a node may hold. 256 entries of 8-byte keys and
   // 8-byte payloads is roughly one 4 KiB page.
@@ -37,6 +44,10 @@ struct Options {
   // Adaptive split: the left node keeps at most this fraction of capacity,
   // leaving slack for late, slightly out-of-order keys.
   double seq_fill = 1.0;
+
+  HintPolicy hints = HintPolicy::None;
+  // Multi hints: number of cached leaves. Rightmost always uses one.
+  std::uint32_t hint_slots = 16;
 };
 
 // Logical I/O counters. A "page read" is one node visited by an operation;
@@ -47,6 +58,7 @@ struct Stats {
   std::uint64_t page_writes = 0;
   std::uint64_t leaf_splits = 0;
   std::uint64_t inner_splits = 0;
+  std::uint64_t hint_hits = 0;  // inserts served by the leaf hint cache
 };
 
 // Space usage of a built tree.

@@ -21,6 +21,11 @@ class BPlusTree {
  public:
   explicit BPlusTree(Options opts = {}) : opts_(opts) {
     assert(opts_.leaf_capacity >= 3 && opts_.inner_capacity >= 3);
+    switch (opts_.hints) {
+      case HintPolicy::None: break;
+      case HintPolicy::Rightmost: hints_.resize(1); break;
+      case HintPolicy::Multi: hints_.resize(std::max(1u, opts_.hint_slots)); break;
+    }
   }
 
   // Inserts key -> value. Returns false (and overwrites the value) if the key
@@ -31,6 +36,9 @@ class BPlusTree {
       root_ = alloc(/*leaf=*/true);
       height_ = 1;
     }
+
+    bool inserted;
+    if (!hints_.empty() && try_hinted_insert(key, value, inserted)) return inserted;
 
     // Descend from the root, remembering the path for split propagation.
     path_.clear();
@@ -48,6 +56,7 @@ class BPlusTree {
     if (pos < leaf.keys.size() && leaf.keys[pos] == key) {
       leaf.vals[pos] = value;
       ++stats_.page_writes;
+      remember_leaf(cur);
       return false;
     }
     leaf.keys.insert(leaf.keys.begin() + pos, key);
@@ -55,10 +64,14 @@ class BPlusTree {
     note_insert(leaf, pos);
     ++stats_.page_writes;
     ++size_;
-    if (leaf.keys.size() <= opts_.leaf_capacity) return true;
+    if (leaf.keys.size() <= opts_.leaf_capacity) {
+      remember_leaf(cur);
+      return true;
+    }
 
     Key up;
     NodeId right = split_leaf(cur, pos, up);
+    remember_leaf(key < up ? cur : right);
 
     // Push the separator up until some ancestor has room.
     while (!path_.empty()) {
@@ -189,6 +202,15 @@ class BPlusTree {
       cur = node(cur).next;
     }
     if (cur != kNoNode) return "leaf chain continues past the last leaf";
+    // Cached fences must match the leaf exactly, or a hinted insert could
+    // place a key in the wrong leaf.
+    for (const auto& h : hints_) {
+      if (h.leaf == kNoNode) continue;
+      const Node& n = node(h.leaf);
+      if (!n.leaf || n.low != h.low || n.high_inf != h.high_inf ||
+          (!n.high_inf && n.high != h.high))
+        return "stale leaf hint for node " + std::to_string(h.leaf);
+    }
     return "";
   }
 
@@ -210,6 +232,73 @@ class BPlusTree {
     std::int32_t last_pos = -1;
     std::uint32_t run = 0;
   };
+
+  // A cached leaf and the key range [low, high) it owns.
+  struct Hint {
+    NodeId leaf = kNoNode;
+    Key low = 0;
+    Key high = 0;
+    bool high_inf = true;
+    std::uint64_t stamp = 0;  // LRU clock
+  };
+
+  // Insert straight into a cached leaf whose fences contain the key. The
+  // range test is in memory; only the leaf itself is read. Gives up (and the
+  // caller descends normally) if the leaf is full, because a split needs the
+  // path to the parent.
+  bool try_hinted_insert(Key key, Value value, bool& inserted) {
+    for (auto& h : hints_) {
+      if (h.leaf == kNoNode || key < h.low || (!h.high_inf && key >= h.high)) continue;
+      Node& leaf = read(h.leaf);
+      auto pos = lower_index(leaf, key);
+      if (pos < leaf.keys.size() && leaf.keys[pos] == key) {
+        leaf.vals[pos] = value;
+        inserted = false;
+      } else {
+        if (leaf.keys.size() >= opts_.leaf_capacity) return false;
+        leaf.keys.insert(leaf.keys.begin() + pos, key);
+        leaf.vals.insert(leaf.vals.begin() + pos, value);
+        note_insert(leaf, pos);
+        ++size_;
+        inserted = true;
+      }
+      ++stats_.page_writes;
+      ++stats_.hint_hits;
+      h.stamp = ++tick_;
+      return true;
+    }
+    return false;
+  }
+
+  // Records the leaf an insert just wrote, evicting the least recently used
+  // entry. The Rightmost policy only ever caches the rightmost leaf.
+  void remember_leaf(NodeId id) {
+    if (hints_.empty()) return;
+    const Node& n = node(id);
+    if (opts_.hints == HintPolicy::Rightmost && !n.high_inf) return;
+    Hint* victim = &hints_.front();
+    for (auto& h : hints_) {
+      if (h.leaf == id) {
+        victim = &h;
+        break;
+      }
+      if (h.stamp < victim->stamp) victim = &h;
+    }
+    *victim = Hint{id, n.low, n.high, n.high_inf, ++tick_};
+  }
+
+  // A split shrinks the left leaf's range; keep any cached copy exact.
+  void hints_after_split(NodeId left) {
+    for (auto& h : hints_) {
+      if (h.leaf != left) continue;
+      if (opts_.hints == HintPolicy::Rightmost) {
+        h.leaf = kNoNode;  // no longer the rightmost leaf
+      } else {
+        h.high = node(left).high;
+        h.high_inf = false;
+      }
+    }
+  }
 
   NodeId alloc(bool leaf) {
     auto n = std::make_unique<Node>();
@@ -350,6 +439,7 @@ class BPlusTree {
     left.high = sep;
     left.high_inf = false;
     split_history(left, right, pos, s, /*leaf=*/true);
+    hints_after_split(id);
     ++stats_.leaf_splits;
     ++stats_.page_writes;
     return rid;
@@ -377,6 +467,8 @@ class BPlusTree {
   Stats stats_;
   std::vector<std::unique_ptr<Node>> pages_;
   std::vector<std::pair<NodeId, std::uint32_t>> path_;  // (inner node, child slot)
+  std::vector<Hint> hints_;
+  std::uint64_t tick_ = 0;
   NodeId root_ = kNoNode;
   std::uint32_t height_ = 0;
   std::uint64_t size_ = 0;
