@@ -1,0 +1,5 @@
+workload,variant,n,insert_ns,reads_per_insert,writes_per_insert,hint_hit_rate,leaf_splits,inner_splits,height,leaves,inners,leaf_fill,inner_fill,size_mib,lookup_reads,lookup_ns,scan1000_reads
+random,baseline,2000000,222.4,2.9772,1.0112,0.0000,11134,63,3,11135,65,0.7016,0.6691,43.75,0.000,0.0,0.00
+random,adaptive-split,2000000,219.8,2.9772,1.0112,0.0000,11134,63,3,11135,65,0.7016,0.6691,43.75,0.000,0.0,0.00
+random,multi-hint,2000000,213.9,2.9683,1.0112,0.0087,11134,63,3,11135,65,0.7016,0.6691,43.75,0.000,0.0,0.00
+random,sa-btree,2000000,224.5,2.9683,1.0112,0.0087,11134,63,3,11135,65,0.7016,0.6691,43.75,0.000,0.0,0.00
