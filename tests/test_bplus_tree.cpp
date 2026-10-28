@@ -35,7 +35,19 @@ std::vector<Config> configs(std::uint32_t leaf_cap, std::uint32_t inner_cap) {
   Options base;
   base.leaf_capacity = leaf_cap;
   base.inner_capacity = inner_cap;
-  return {{"middle", base}};
+  Options insert_point = base;
+  insert_point.split = SplitPolicy::InsertPoint;
+  Options adaptive = base;
+  adaptive.split = SplitPolicy::Adaptive;
+  Options adaptive90 = adaptive;
+  adaptive90.seq_fill = 0.9;
+  Options eager = adaptive;
+  eager.run_threshold = 0;  // every split is treated as part of a run
+  return {{"middle", base},
+          {"insert-point", insert_point},
+          {"adaptive", adaptive},
+          {"adaptive-f90", adaptive90},
+          {"adaptive-eager", eager}};
 }
 
 // Inserts `keys` in order, checking against a std::map every `every` steps.
@@ -168,6 +180,49 @@ void test_sequential_page_reads() {
   }
 }
 
+void test_adaptive_split_fills_pages() {
+  Options mid;
+  mid.leaf_capacity = 64;
+  mid.inner_capacity = 64;
+  Options ada = mid;
+  ada.split = SplitPolicy::Adaptive;
+  BPlusTree a(mid), b(ada);
+  for (Key k = 0; k < 100000; ++k) {
+    a.insert(k, k);
+    b.insert(k, k);
+  }
+  EXPECT(a.shape().leaf_fill < 0.52, "middle split leaves sequential leaves half full");
+  EXPECT(b.shape().leaf_fill > 0.99, "adaptive split packs sequential leaves");
+  EXPECT(b.shape().inner_fill > 0.9, "adaptive split packs inner nodes too");
+  EXPECT(b.shape().leaves < 0.52 * a.shape().leaves, "about half as many leaves");
+
+  // Random order must not trigger the append path.
+  BPlusTree c(mid), d(ada);
+  for (Key k : random_keys(100000, 11)) {
+    c.insert(k, k);
+    d.insert(k, k);
+  }
+  EXPECT(c.shape().leaves == d.shape().leaves, "adaptive split is inert on random keys");
+}
+
+void test_streams_keep_pages_full() {
+  // Many interleaved ascending streams: the naive insert-point split strands
+  // the head of the neighbouring stream, the adaptive split does not.
+  Options naive;
+  naive.leaf_capacity = 64;
+  naive.inner_capacity = 64;
+  naive.split = SplitPolicy::InsertPoint;
+  Options ada = naive;
+  ada.split = SplitPolicy::Adaptive;
+  BPlusTree a(naive), b(ada);
+  for (Key k : stream_keys(200000, 32, 5)) {
+    a.insert(k, k);
+    b.insert(k, k);
+  }
+  EXPECT(b.shape().leaf_fill > 0.95, "adaptive split keeps stream leaves full");
+  EXPECT(b.shape().leaf_fill > a.shape().leaf_fill, "adaptive beats insert-point on streams");
+}
+
 }  // namespace
 
 int main() {
@@ -177,6 +232,8 @@ int main() {
       {"workloads", test_workloads},
       {"mixed_operations", test_mixed_operations},
       {"sequential_page_reads", test_sequential_page_reads},
+      {"adaptive_split_fills_pages", test_adaptive_split_fills_pages},
+      {"streams_keep_pages_full", test_streams_keep_pages_full},
   };
   for (const auto& [name, fn] : tests) {
     int before = g_failures;
