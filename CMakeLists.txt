@@ -21,3 +21,6 @@ enable_testing()
 add_executable(test_bplus_tree tests/test_bplus_tree.cpp)
 target_link_libraries(test_bplus_tree PRIVATE sabtree)
 add_test(NAME test_bplus_tree COMMAND test_bplus_tree)
+
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench PRIVATE sabtree)
