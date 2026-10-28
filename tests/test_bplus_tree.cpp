@@ -1,0 +1,192 @@
+// Differential tests: every tree configuration is driven with the same
+// operation streams as a std::map and must agree with it at every step, while
+// check() keeps passing.
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "sabtree/bplus_tree.h"
+#include "sabtree/workloads.h"
+
+using namespace sabtree;
+
+namespace {
+
+int g_failures = 0;
+
+#define EXPECT(cond, msg)                                                     \
+  do {                                                                        \
+    if (!(cond)) {                                                            \
+      std::fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
+      ++g_failures;                                                           \
+      return;                                                                 \
+    }                                                                         \
+  } while (0)
+
+struct Config {
+  std::string name;
+  Options opts;
+};
+
+std::vector<Config> configs(std::uint32_t leaf_cap, std::uint32_t inner_cap) {
+  Options base;
+  base.leaf_capacity = leaf_cap;
+  base.inner_capacity = inner_cap;
+  return {{"middle", base}};
+}
+
+// Inserts `keys` in order, checking against a std::map every `every` steps.
+void run_inserts(const Config& c, const std::vector<Key>& keys, std::size_t every) {
+  BPlusTree t(c.opts);
+  std::map<Key, Value> ref;
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    bool fresh = ref.insert_or_assign(keys[i], i).second;
+    EXPECT(t.insert(keys[i], i) == fresh, "insert return value");
+    if (i % every == 0 || i + 1 == keys.size()) {
+      auto err = t.check();
+      EXPECT(err.empty(), err.c_str());
+    }
+  }
+  EXPECT(t.size() == ref.size(), "size");
+  for (const auto& [k, v] : ref) EXPECT(t.find(k) == v, "find after load");
+  std::vector<Key> got;
+  t.scan(0, ~Key{0}, [&](Key k, Value) { got.push_back(k); });
+  EXPECT(got.size() == ref.size(), "full scan size");
+  std::size_t i = 0;
+  for (const auto& kv : ref) EXPECT(got[i++] == kv.first, "full scan order");
+}
+
+// Random mix of inserts, overwrites, erases, lookups and range scans.
+void run_mixed(const Config& c, std::uint64_t seed, int ops, Key domain) {
+  BPlusTree t(c.opts);
+  std::map<Key, Value> ref;
+  SplitMix64 rng(seed);
+  for (int i = 0; i < ops; ++i) {
+    Key k = rng.next() % domain;
+    auto op = rng.next() % 10;
+    if (op < 5) {
+      bool fresh = ref.insert_or_assign(k, i).second;
+      EXPECT(t.insert(k, i) == fresh, "insert return value");
+    } else if (op < 7) {
+      EXPECT(t.erase(k) == (ref.erase(k) == 1), "erase return value");
+    } else if (op < 9) {
+      auto it = ref.find(k);
+      auto got = t.find(k);
+      EXPECT(got.has_value() == (it != ref.end()), "find presence");
+      if (got) EXPECT(*got == it->second, "find value");
+    } else {
+      Key hi = k + rng.next() % 64;
+      std::vector<Key> got, want;
+      t.scan(k, hi, [&](Key kk, Value) { got.push_back(kk); });
+      for (auto it = ref.lower_bound(k); it != ref.end() && it->first <= hi; ++it)
+        want.push_back(it->first);
+      EXPECT(got == want, "range scan");
+    }
+    if (i % 997 == 0) {
+      auto err = t.check();
+      EXPECT(err.empty(), err.c_str());
+    }
+  }
+  auto err = t.check();
+  EXPECT(err.empty(), err.c_str());
+  EXPECT(t.size() == ref.size(), "size after mixed ops");
+}
+
+void test_empty_tree() {
+  BPlusTree t;
+  EXPECT(t.size() == 0, "empty size");
+  EXPECT(!t.find(42), "find on empty tree");
+  EXPECT(!t.erase(42), "erase on empty tree");
+  EXPECT(t.scan(0, 100, [](Key, Value) {}) == 0, "scan on empty tree");
+  EXPECT(t.check().empty(), "empty tree invariants");
+}
+
+void test_extreme_keys() {
+  for (const auto& c : configs(3, 3)) {
+    BPlusTree t(c.opts);
+    const Key max = ~Key{0};
+    std::vector<Key> keys = {max, 0, max - 1, 1, max / 2, max - 2, 2};
+    for (Key k : keys) t.insert(k, k);
+    EXPECT(t.check().empty(), "extreme keys invariants");
+    for (Key k : keys) EXPECT(t.find(k) == k, "extreme key lookup");
+    EXPECT(t.scan(max - 2, max, [](Key, Value) {}) == 3, "scan up to max key");
+  }
+}
+
+void test_workloads() {
+  const std::size_t n = 20000;
+  std::vector<std::pair<std::string, std::vector<Key>>> loads = {
+      {"sequential", sequential_keys(n)},
+      {"descending", descending_keys(n)},
+      {"random", random_keys(n, 7)},
+      {"streams-4", stream_keys(n, 4, 7)},
+      {"streams-64", stream_keys(n, 64, 7)},
+      {"nearly-sorted", nearly_sorted_keys(n, 0.05, 500, 7)},
+  };
+  for (auto caps : {std::pair<std::uint32_t, std::uint32_t>{3, 3}, {4, 5}, {16, 8}, {256, 256}}) {
+    for (const auto& c : configs(caps.first, caps.second)) {
+      for (const auto& [name, keys] : loads) {
+        int before = g_failures;
+        run_inserts(c, keys, caps.first < 16 ? 101 : 2003);
+        if (g_failures != before)
+          std::fprintf(stderr, "  ^ config=%s caps=%u/%u workload=%s\n", c.name.c_str(),
+                       caps.first, caps.second, name.c_str());
+      }
+    }
+  }
+}
+
+void test_mixed_operations() {
+  for (auto caps : {std::pair<std::uint32_t, std::uint32_t>{3, 3}, {5, 4}, {32, 16}}) {
+    for (const auto& c : configs(caps.first, caps.second)) {
+      for (std::uint64_t seed : {1, 2, 3}) {
+        int before = g_failures;
+        run_mixed(c, seed, 60000, 4000);
+        if (g_failures != before)
+          std::fprintf(stderr, "  ^ config=%s caps=%u/%u seed=%llu\n", c.name.c_str(),
+                       caps.first, caps.second, static_cast<unsigned long long>(seed));
+      }
+    }
+  }
+}
+
+void test_sequential_page_reads() {
+  // Without any shortcut every insert walks root-to-leaf: reads == height.
+  Options o;
+  o.leaf_capacity = 8;
+  o.inner_capacity = 8;
+  BPlusTree t(o);
+  for (Key k = 0; k < 1000; ++k) t.insert(k, k);
+  for (Key k = 1000; k < 1100; ++k) {
+    auto h = t.height();  // read before the insert: a root split may grow it
+    t.reset_stats();
+    t.insert(k, k);
+    EXPECT(t.stats().page_reads == h, "baseline insert reads one page per level");
+  }
+}
+
+}  // namespace
+
+int main() {
+  const std::vector<std::pair<const char*, std::function<void()>>> tests = {
+      {"empty_tree", test_empty_tree},
+      {"extreme_keys", test_extreme_keys},
+      {"workloads", test_workloads},
+      {"mixed_operations", test_mixed_operations},
+      {"sequential_page_reads", test_sequential_page_reads},
+  };
+  for (const auto& [name, fn] : tests) {
+    int before = g_failures;
+    fn();
+    std::printf("[%s] %s\n", g_failures == before ? " OK " : "FAIL", name);
+  }
+  if (g_failures) {
+    std::printf("%d failure(s)\n", g_failures);
+    return EXIT_FAILURE;
+  }
+  std::printf("all tests passed\n");
+  return EXIT_SUCCESS;
+}

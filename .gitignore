@@ -21,3 +21,4 @@ paper/*.bbl
 paper/*.blg
 paper/*.toc
 paper/*.synctex.gz
+compile_commands.json
