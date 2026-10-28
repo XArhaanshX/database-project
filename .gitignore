@@ -1,0 +1,23 @@
+# build trees
+build/
+build-*/
+cmake-build-*/
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# python
+__pycache__/
+.venv/
+
+# latex intermediates (the compiled paper PDF is kept)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.toc
+paper/*.synctex.gz
