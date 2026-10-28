@@ -16,7 +16,11 @@ inline constexpr NodeId kNoNode = std::numeric_limits<NodeId>::max();
 
 // Where an overflowing node is cut in two.
 enum class SplitPolicy {
-  Middle,  // textbook 50/50 split
+  Middle,       // textbook 50/50 split
+  InsertPoint,  // if the last two inserts were adjacent, cut at the new key
+                // and start the right node with it (InnoDB-style heuristic)
+  Adaptive,     // cut just after the new key once an ascending run of
+                // `run_threshold` adjacent inserts has been seen (ours)
 };
 
 struct Options {
@@ -26,6 +30,13 @@ struct Options {
   std::uint32_t inner_capacity = 256;
 
   SplitPolicy split = SplitPolicy::Middle;
+
+  // Adaptive split: number of consecutive "insert right after the previous
+  // insert" events a node must see before it is treated as append-only.
+  std::uint32_t run_threshold = 3;
+  // Adaptive split: the left node keeps at most this fraction of capacity,
+  // leaving slack for late, slightly out-of-order keys.
+  double seq_fill = 1.0;
 };
 
 // Logical I/O counters. A "page read" is one node visited by an operation;

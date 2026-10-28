@@ -52,6 +52,7 @@ class BPlusTree {
     }
     leaf.keys.insert(leaf.keys.begin() + pos, key);
     leaf.vals.insert(leaf.vals.begin() + pos, value);
+    note_insert(leaf, pos);
     ++stats_.page_writes;
     ++size_;
     if (leaf.keys.size() <= opts_.leaf_capacity) return true;
@@ -66,6 +67,7 @@ class BPlusTree {
       Node& p = node(pid);
       p.keys.insert(p.keys.begin() + cidx, up);
       p.children.insert(p.children.begin() + cidx + 1, right);
+      note_insert(p, cidx);
       ++stats_.page_writes;
       if (p.keys.size() <= opts_.inner_capacity) return true;
       right = split_inner(pid, cidx, up);
@@ -139,6 +141,8 @@ class BPlusTree {
     if (pos == leaf.keys.size() || leaf.keys[pos] != key) return false;
     leaf.keys.erase(leaf.keys.begin() + pos);
     leaf.vals.erase(leaf.vals.begin() + pos);
+    leaf.last_pos = -1;  // positions shifted; forget the current run
+    leaf.run = 0;
     ++stats_.page_writes;
     --size_;
     return true;
@@ -200,6 +204,11 @@ class BPlusTree {
     Key low = 0;
     Key high = 0;
     bool high_inf = true;  // rightmost leaf: no upper bound
+    // Insert-direction bookkeeping, in the spirit of InnoDB's PAGE_LAST_INSERT
+    // and PAGE_N_DIRECTION: the slot of the last insert and how many inserts
+    // in a row landed immediately to the right of the previous one.
+    std::int32_t last_pos = -1;
+    std::uint32_t run = 0;
   };
 
   NodeId alloc(bool leaf) {
@@ -266,11 +275,58 @@ class BPlusTree {
         std::lower_bound(n.keys.begin(), n.keys.end(), key) - n.keys.begin());
   }
 
+  static void note_insert(Node& n, std::uint32_t pos) {
+    if (n.last_pos >= 0 && pos == static_cast<std::uint32_t>(n.last_pos) + 1)
+      ++n.run;
+    else
+      n.run = 0;
+    n.last_pos = static_cast<std::int32_t>(pos);
+  }
+
   // Number of keys that stay in the left node. `n` is the overflowing key
-  // count and `pos` the slot the new key landed in.
-  std::uint32_t choose_split(const Node& /*node*/, std::uint32_t /*pos*/, std::uint32_t n,
-                             bool /*leaf*/) const {
+  // count and `pos` the slot the new key landed in. A leaf needs
+  // 1 <= s <= n-1; an inner node moves key s up and needs a key on each side,
+  // so 1 <= s <= n-2.
+  std::uint32_t choose_split(const Node& nd, std::uint32_t pos, std::uint32_t n,
+                             bool leaf) const {
+    const std::uint32_t hi = leaf ? n - 1 : n - 2;
+    auto clamp = [hi](std::uint32_t s) { return std::min(std::max(s, 1u), hi); };
+    switch (opts_.split) {
+      case SplitPolicy::Middle:
+        break;
+      case SplitPolicy::InsertPoint:
+        if (nd.run >= 1) return clamp(pos);
+        break;
+      case SplitPolicy::Adaptive:
+        if (nd.run >= opts_.run_threshold) {
+          // Keep the new key on the left, so the run keeps appending to a node
+          // that holds only its own keys and whatever followed it moves out.
+          // For a pure append this leaves the left node completely full.
+          auto cap = leaf ? opts_.leaf_capacity : opts_.inner_capacity;
+          auto limit = std::max(1u, static_cast<std::uint32_t>(opts_.seq_fill * cap));
+          return clamp(std::min(pos + 1, limit));
+        }
+        break;
+    }
     return n / 2;
+  }
+
+  // After a split, the half that received the new key inherits the run;
+  // the other half starts with no history.
+  static void split_history(Node& left, Node& right, std::uint32_t pos, std::uint32_t s,
+                            bool leaf) {
+    const std::uint32_t run = left.run;
+    left.last_pos = -1;
+    left.run = 0;
+    right.last_pos = -1;
+    right.run = 0;
+    if (pos < s) {
+      left.last_pos = static_cast<std::int32_t>(pos);
+      left.run = run;
+    } else if (leaf || pos > s) {
+      right.last_pos = static_cast<std::int32_t>(pos - s - (leaf ? 0 : 1));
+      right.run = run;
+    }
   }
 
   // Splits an overflowing leaf; returns the new right sibling and stores the
@@ -293,6 +349,7 @@ class BPlusTree {
     right.high_inf = left.high_inf;
     left.high = sep;
     left.high_inf = false;
+    split_history(left, right, pos, s, /*leaf=*/true);
     ++stats_.leaf_splits;
     ++stats_.page_writes;
     return rid;
@@ -310,6 +367,7 @@ class BPlusTree {
     right.children.assign(left.children.begin() + s + 1, left.children.end());
     left.keys.resize(s);
     left.children.resize(s + 1);
+    split_history(left, right, pos, s, /*leaf=*/false);
     ++stats_.inner_splits;
     ++stats_.page_writes;
     return rid;
