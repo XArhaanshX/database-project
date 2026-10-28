@@ -42,8 +42,9 @@ struct Options {
   // insert" events a node must see before it is treated as append-only.
   std::uint32_t run_threshold = 3;
   // Adaptive split: the left node keeps at most this fraction of capacity,
-  // leaving slack for late, slightly out-of-order keys.
-  double seq_fill = 1.0;
+  // leaving slack for late, slightly out-of-order keys. 0.9 matches
+  // PostgreSQL's default B-tree fillfactor; 1.0 packs append-only data fully.
+  double seq_fill = 0.9;
 
   HintPolicy hints = HintPolicy::None;
   // Multi hints: number of cached leaves. Rightmost always uses one.
@@ -58,7 +59,8 @@ struct Stats {
   std::uint64_t page_writes = 0;
   std::uint64_t leaf_splits = 0;
   std::uint64_t inner_splits = 0;
-  std::uint64_t hint_hits = 0;  // inserts served by the leaf hint cache
+  std::uint64_t hint_probes = 0;  // inserts that consulted the leaf hint cache
+  std::uint64_t hint_hits = 0;    // inserts served by the leaf hint cache
 };
 
 // Space usage of a built tree.
