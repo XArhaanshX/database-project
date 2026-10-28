@@ -37,7 +37,7 @@ The **SA-B+-tree** (stream-aware B+-tree) changes three things:
 ## Results
 
 2,000,000 inserts of 64-bit keys, 256-entry nodes (≈ 4 KiB pages),
-in memory, single thread, Intel Core Ultra 9 285H, GCC 16 `-O2`. Times are the
+in memory, single thread, Intel Core Ultra 9 285H, GCC 16 `-O3`. Times are the
 best of 7 interleaved runs (see [Methodology](#methodology)); page counts are
 exact and deterministic.
 
@@ -73,7 +73,7 @@ techniques combined match it on a single clean append stream, where 100%
 packing even beats our 90%. They lose most of their benefit once there are
 several streams or a few late records.
 
-![Main results](results/figures/main.png)
+![Main results](results/figures/summary.png)
 
 **Many streams.** The hint cache covers as many streams as it has slots, and
 the adaptive split keeps pages ~90% full up to 64 streams (78% at 1,024).
@@ -111,6 +111,14 @@ uv run scripts/plot_results.py       # redraw results/figures/
 
 `CPU=<id>` pins the benchmark to one core with `taskset`. On hybrid Intel
 CPUs, pick a performance core.
+
+## Paper
+
+[`paper/main.pdf`](paper/main.pdf) is a 6-page IEEE-style write-up. It covers
+the design, a small cost model that predicts the measured page reads and fill,
+the full evaluation and related work. Rebuild it with
+`scripts/build_paper.sh`, which needs [tectonic](https://tectonic-typesetting.github.io/)
+or latexmk; run `scripts/plot_results.py` first if the results changed.
 
 ## Using the tree
 
@@ -150,7 +158,7 @@ tests/             differential tests vs std::map for 10 configurations
 bench/bench.cpp    benchmark driver (variants x workloads, two sweeps, A/B)
 scripts/           run_benchmarks.sh, plot_results.py
 results/           CSV results, ENV.txt (machine), figures/
-paper/             LaTeX source and PDF of the write-up
+paper/             LaTeX source, figures and PDF of the write-up
 ```
 
 ## Methodology
