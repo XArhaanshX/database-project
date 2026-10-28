@@ -6,7 +6,9 @@
 
     uv run scripts/plot_results.py            # or: python3 scripts/plot_results.py
 
-Writes PDF (for LaTeX) and PNG (for the README) into results/figures/.
+Writes PDF and PNG into results/figures/, and a copy of each PDF into
+paper/figures/ (TeX engines such as tectonic only read files below the
+document's own directory).
 """
 import csv
 import pathlib
@@ -19,6 +21,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
 FIGURES = RESULTS / "figures"
+PAPER_FIGURES = ROOT / "paper" / "figures"
 
 # Each variant keeps one colour, marker and line style in every figure.
 # Colours are slots of a CVD-checked categorical palette; marker and dash
@@ -80,8 +83,10 @@ def style_axes(ax):
 
 
 def save(fig, stem):
-    FIGURES.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIGURES / f"{stem}.pdf", bbox_inches="tight")
+    for d in (FIGURES, PAPER_FIGURES):
+        d.mkdir(parents=True, exist_ok=True)
+        # No creation date, so re-running the script does not churn git.
+        fig.savefig(d / f"{stem}.pdf", bbox_inches="tight", metadata={"CreationDate": None})
     fig.savefig(FIGURES / f"{stem}.png", bbox_inches="tight")
     plt.close(fig)
 
@@ -118,7 +123,7 @@ def fig_main(rows):
     fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 1.08),
                handlelength=1.6, columnspacing=1.4)
     fig.tight_layout(w_pad=1.2)
-    save(fig, "main")
+    save(fig, "summary")
 
 
 def end_label(ax, x, y, text, color, dy=0):
