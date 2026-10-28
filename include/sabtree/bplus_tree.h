@@ -260,13 +260,23 @@ class BPlusTree {
   // so "key in range" is the single unsigned compare key - low <= span.
   static Key span_of(const Node& n) { return (n.high_inf ? ~Key{0} : n.high - 1) - n.low; }
 
+  bool hint_matches(std::size_t i, Key key) const {
+    return key - hint_lo_[i] <= hint_span_[i] && hint_leaf_[i] != kNoNode;
+  }
+
   // Returns the slot whose leaf owns `key`, or -1. Cached leaves have
   // disjoint ranges, so at most one slot can match. Empty slots have
   // low = max key and span 0 and so can only match the max key itself.
-  int probe_hints(Key key) const {
-    for (std::size_t i = 0; i < hint_lo_.size(); ++i)
-      if (key - hint_lo_[i] <= hint_span_[i] && hint_leaf_[i] != kNoNode)
+  // The slot used last is tried first: with one dominant stream (plus a few
+  // stragglers filling the other slots) that is almost always the answer.
+  int probe_hints(Key key) {
+    if (hint_matches(last_slot_, key)) return static_cast<int>(last_slot_);
+    for (std::size_t i = 0; i < hint_lo_.size(); ++i) {
+      if (hint_matches(i, key)) {
+        last_slot_ = i;
         return static_cast<int>(i);
+      }
+    }
     return -1;
   }
 
@@ -312,6 +322,7 @@ class BPlusTree {
     hint_lo_[victim] = n.low;
     hint_span_[victim] = span_of(n);
     hint_stamp_[victim] = ++tick_;
+    last_slot_ = victim;
   }
 
   // A split shrinks the left leaf's range; keep any cached copy exact.
@@ -512,6 +523,7 @@ class BPlusTree {
   std::vector<NodeId> hint_leaf_;
   std::vector<std::uint64_t> hint_stamp_;  // LRU clock values
   std::uint64_t tick_ = 0;
+  std::size_t last_slot_ = 0;  // slot of the most recent hit or fill
   bool hints_on_ = true;            // false: sampling only (see insert())
   std::uint32_t window_probes_ = 0;
   std::uint32_t window_hits_ = 0;
