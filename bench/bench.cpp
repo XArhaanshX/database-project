@@ -42,14 +42,14 @@ std::vector<Variant> variants() {
   sa.hints = HintPolicy::Multi;
   Options sa100 = sa;
   sa100.seq_fill = 1.0;
-  Options sa64 = sa;
-  sa64.hint_slots = 64;
+  Options sa16 = sa;
+  sa16.hint_slots = 16;
   return {
       {"baseline", base},           {"rightmost", rightmost},
       {"insert-point", insert_point}, {"rightmost+insert-point", existing},
       {"adaptive-split", adaptive}, {"multi-hint", multi},
       {"sa-btree", sa},             {"sa-btree-f100", sa100},
-      {"sa-btree-64slots", sa64},
+      {"sa-btree-16slots", sa16},
   };
 }
 
@@ -216,11 +216,11 @@ int main(int argc, char** argv) {
   }
   std::fclose(f);
 
-  // 2. Number of interleaved streams vs. the hint cache size.
+  // 2. Number of interleaved streams vs. the hint cache size (64 vs 16).
   f = std::fopen((out + "/streams_sweep.csv").c_str(), "w");
   std::fputs(kHeader, f);
   const auto stream_vs = pick(all, {"baseline", "rightmost+insert-point", "adaptive-split",
-                                    "sa-btree", "sa-btree-64slots"});
+                                    "sa-btree-16slots", "sa-btree"});
   for (std::uint32_t streams : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 1024u}) {
     auto rs = measure(stream_vs, stream_keys(n, streams, seed), std::min(reps, 5), false);
     for (std::size_t v = 0; v < stream_vs.size(); ++v)
