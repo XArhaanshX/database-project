@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -168,6 +169,25 @@ class BPlusTree {
     return s;
   }
 
+  // Verifies the structural invariants. Returns an empty string if the tree
+  // is well formed, otherwise a description of the first violation found.
+  std::string check() const {
+    if (root_ == kNoNode) return size_ == 0 ? "" : "empty tree with nonzero size";
+    std::vector<NodeId> leaves;
+    std::uint64_t entries = 0;
+    std::string err = check_node(root_, 0, false, 0, true, 1, leaves, entries);
+    if (!err.empty()) return err;
+    if (entries != size_) return "entry count does not match size()";
+    // The sibling chain must visit exactly the leaves in key order.
+    NodeId cur = leaves.front();
+    for (std::size_t i = 0; i < leaves.size(); ++i) {
+      if (cur != leaves[i]) return "leaf chain out of order at leaf " + std::to_string(i);
+      cur = node(cur).next;
+    }
+    if (cur != kNoNode) return "leaf chain continues past the last leaf";
+    return "";
+  }
+
  private:
   struct Node {
     bool leaf = true;
@@ -175,6 +195,11 @@ class BPlusTree {
     std::vector<Value> vals;        // leaves only
     std::vector<NodeId> children;   // inner nodes only, keys.size() + 1 entries
     NodeId next = kNoNode;          // right sibling (leaves only)
+    // Fence keys (leaves only): the leaf owns exactly [low, high). They are
+    // fixed at split time, so they stay valid when keys are erased.
+    Key low = 0;
+    Key high = 0;
+    bool high_inf = true;  // rightmost leaf: no upper bound
   };
 
   NodeId alloc(bool leaf) {
@@ -197,6 +222,43 @@ class BPlusTree {
   static std::uint32_t child_index(const Node& n, Key key) {
     return static_cast<std::uint32_t>(
         std::upper_bound(n.keys.begin(), n.keys.end(), key) - n.keys.begin());
+  }
+
+  // Recursive part of check(). The subtree at `id` must hold keys in
+  // [lo, hi) (hi unbounded when hi_inf) and sit at the given depth.
+  std::string check_node(NodeId id, Key lo, bool lo_set, Key hi, bool hi_inf,
+                         std::uint32_t depth, std::vector<NodeId>& leaves,
+                         std::uint64_t& entries) const {
+    const Node& n = node(id);
+    const std::string where = " (node " + std::to_string(id) + ")";
+    for (std::size_t i = 1; i < n.keys.size(); ++i)
+      if (n.keys[i - 1] >= n.keys[i]) return "keys not strictly increasing" + where;
+    for (Key k : n.keys) {
+      if (lo_set && k < lo) return "key below lower bound" + where;
+      if (!hi_inf && k >= hi) return "key at or above upper bound" + where;
+    }
+    if (n.leaf) {
+      if (depth != height_) return "leaf at wrong depth" + where;
+      if (n.keys.size() > opts_.leaf_capacity) return "leaf over capacity" + where;
+      if (n.vals.size() != n.keys.size()) return "value count mismatch" + where;
+      if (n.low != (lo_set ? lo : 0)) return "low fence mismatch" + where;
+      if (n.high_inf != hi_inf || (!hi_inf && n.high != hi)) return "high fence mismatch" + where;
+      leaves.push_back(id);
+      entries += n.keys.size();
+      return "";
+    }
+    if (n.keys.empty()) return "inner node without keys" + where;
+    if (n.keys.size() > opts_.inner_capacity) return "inner node over capacity" + where;
+    if (n.children.size() != n.keys.size() + 1) return "child count mismatch" + where;
+    for (std::size_t i = 0; i < n.children.size(); ++i) {
+      Key clo = i == 0 ? lo : n.keys[i - 1];
+      bool clo_set = i == 0 ? lo_set : true;
+      Key chi = i == n.keys.size() ? hi : n.keys[i];
+      bool chi_inf = i == n.keys.size() ? hi_inf : false;
+      auto err = check_node(n.children[i], clo, clo_set, chi, chi_inf, depth + 1, leaves, entries);
+      if (!err.empty()) return err;
+    }
+    return "";
   }
 
   static std::uint32_t lower_index(const Node& n, Key key) {
@@ -226,6 +288,11 @@ class BPlusTree {
     right.next = left.next;
     left.next = rid;
     sep = right.keys.front();
+    right.low = sep;
+    right.high = left.high;
+    right.high_inf = left.high_inf;
+    left.high = sep;
+    left.high_inf = false;
     ++stats_.leaf_splits;
     ++stats_.page_writes;
     return rid;
