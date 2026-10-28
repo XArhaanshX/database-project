@@ -39,8 +39,8 @@ std::vector<Config> configs(std::uint32_t leaf_cap, std::uint32_t inner_cap) {
   insert_point.split = SplitPolicy::InsertPoint;
   Options adaptive = base;
   adaptive.split = SplitPolicy::Adaptive;
-  Options adaptive90 = adaptive;
-  adaptive90.seq_fill = 0.9;
+  Options adaptive100 = adaptive;
+  adaptive100.seq_fill = 1.0;
   Options eager = adaptive;
   eager.run_threshold = 0;  // every split is treated as part of a run
   Options rightmost = base;
@@ -52,18 +52,18 @@ std::vector<Config> configs(std::uint32_t leaf_cap, std::uint32_t inner_cap) {
   one_slot.hint_slots = 1;
   Options ours = adaptive;
   ours.hints = HintPolicy::Multi;
-  Options ours90 = ours;
-  ours90.seq_fill = 0.9;
+  Options ours100 = ours;
+  ours100.seq_fill = 1.0;
   return {{"middle", base},
           {"insert-point", insert_point},
           {"adaptive", adaptive},
-          {"adaptive-f90", adaptive90},
+          {"adaptive-f100", adaptive100},
           {"adaptive-eager", eager},
           {"rightmost-hint", rightmost},
           {"multi-hint", multi},
           {"multi-hint-1", one_slot},
           {"adaptive+multi", ours},
-          {"adaptive-f90+multi", ours90}};
+          {"adaptive-f100+multi", ours100}};
 }
 
 // Inserts `keys` in order, checking against a std::map every `every` steps.
@@ -202,6 +202,7 @@ void test_adaptive_split_fills_pages() {
   mid.inner_capacity = 64;
   Options ada = mid;
   ada.split = SplitPolicy::Adaptive;
+  ada.seq_fill = 1.0;
   BPlusTree a(mid), b(ada);
   for (Key k = 0; k < 100000; ++k) {
     a.insert(k, k);
@@ -230,6 +231,7 @@ void test_streams_keep_pages_full() {
   naive.split = SplitPolicy::InsertPoint;
   Options ada = naive;
   ada.split = SplitPolicy::Adaptive;
+  ada.seq_fill = 1.0;
   BPlusTree a(naive), b(ada);
   for (Key k : stream_keys(200000, 32, 5)) {
     a.insert(k, k);
@@ -237,6 +239,39 @@ void test_streams_keep_pages_full() {
   }
   EXPECT(b.shape().leaf_fill > 0.95, "adaptive split keeps stream leaves full");
   EXPECT(b.shape().leaf_fill > a.shape().leaf_fill, "adaptive beats insert-point on streams");
+}
+
+void test_fill_limit_absorbs_late_keys() {
+  // With 2% of keys arriving late, pages packed to 100% get split again by
+  // the stragglers; a 90% limit leaves room for them.
+  Options full;
+  full.leaf_capacity = 64;
+  full.inner_capacity = 64;
+  full.split = SplitPolicy::Adaptive;
+  full.seq_fill = 1.0;
+  Options slack = full;
+  slack.seq_fill = 0.9;
+  BPlusTree a(full), b(slack);
+  for (Key k : nearly_sorted_keys(100000, 0.02, 200, 9)) {
+    a.insert(k, k);
+    b.insert(k, k);
+  }
+  EXPECT(b.shape().leaf_fill > 0.85, "90% fill limit keeps leaves dense");
+  EXPECT(b.shape().leaf_fill > a.shape().leaf_fill + 0.2, "slack beats full packing");
+}
+
+void test_random_keys_bypass_hints() {
+  Options o;
+  o.hints = HintPolicy::Multi;
+  BPlusTree t(o);
+  auto keys = random_keys(1000000, 4);
+  for (std::size_t i = 0; i < 500000; ++i) t.insert(keys[i], i);
+  t.reset_stats();
+  for (std::size_t i = 500000; i < keys.size(); ++i) t.insert(keys[i], i);
+  // Once the tree is large, probes keep missing and the cache backs off to
+  // sampling, so few inserts pay for a probe.
+  EXPECT(t.stats().hint_probes < 0.2 * 500000, "hint probes back off on random keys");
+  EXPECT(t.check().empty(), "invariants after bypass");
 }
 
 void test_hints_skip_descent() {
@@ -309,6 +344,8 @@ int main() {
       {"sequential_page_reads", test_sequential_page_reads},
       {"adaptive_split_fills_pages", test_adaptive_split_fills_pages},
       {"streams_keep_pages_full", test_streams_keep_pages_full},
+      {"fill_limit_absorbs_late_keys", test_fill_limit_absorbs_late_keys},
+      {"random_keys_bypass_hints", test_random_keys_bypass_hints},
       {"hints_skip_descent", test_hints_skip_descent},
       {"hint_survives_overwrites_and_erases", test_hint_survives_overwrites_and_erases},
   };
