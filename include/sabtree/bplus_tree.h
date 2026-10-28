@@ -21,11 +21,16 @@ class BPlusTree {
  public:
   explicit BPlusTree(Options opts = {}) : opts_(opts) {
     assert(opts_.leaf_capacity >= 3 && opts_.inner_capacity >= 3);
+    std::size_t slots = 0;
     switch (opts_.hints) {
       case HintPolicy::None: break;
-      case HintPolicy::Rightmost: hints_.resize(1); break;
-      case HintPolicy::Multi: hints_.resize(std::max(1u, opts_.hint_slots)); break;
+      case HintPolicy::Rightmost: slots = 1; break;
+      case HintPolicy::Multi: slots = std::max(1u, opts_.hint_slots); break;
     }
+    hint_lo_.assign(slots, ~Key{0});
+    hint_span_.assign(slots, 0);
+    hint_leaf_.assign(slots, kNoNode);
+    hint_stamp_.assign(slots, 0);
   }
 
   // Inserts key -> value. Returns false (and overwrites the value) if the key
@@ -37,8 +42,24 @@ class BPlusTree {
       height_ = 1;
     }
 
-    bool inserted;
-    if (!hints_.empty() && try_hinted_insert(key, value, inserted)) return inserted;
+    // Probe the hint cache while it is paying off. Every kHintWindow probes
+    // the hit rate is checked; below one half (random keys, or more streams
+    // than slots) the cache is only consulted on every kHintSample-th insert,
+    // and it switches back on once a window of samples hits again.
+    int slot = -1;
+    const bool use_hints =
+        !hint_leaf_.empty() && (hints_on_ || stats_.inserts % kHintSample == 0);
+    if (use_hints) {
+      ++stats_.hint_probes;
+      slot = probe_hints(key);
+      if (slot >= 0) ++window_hits_;
+      if (++window_probes_ == kHintWindow) {
+        hints_on_ = 2 * window_hits_ >= window_probes_;
+        window_probes_ = window_hits_ = 0;
+      }
+      bool inserted;
+      if (slot >= 0 && hinted_insert(slot, key, value, inserted)) return inserted;
+    }
 
     // Descend from the root, remembering the path for split propagation.
     path_.clear();
@@ -56,7 +77,7 @@ class BPlusTree {
     if (pos < leaf.keys.size() && leaf.keys[pos] == key) {
       leaf.vals[pos] = value;
       ++stats_.page_writes;
-      remember_leaf(cur);
+      if (use_hints) remember_leaf(cur, slot);
       return false;
     }
     leaf.keys.insert(leaf.keys.begin() + pos, key);
@@ -65,13 +86,13 @@ class BPlusTree {
     ++stats_.page_writes;
     ++size_;
     if (leaf.keys.size() <= opts_.leaf_capacity) {
-      remember_leaf(cur);
+      if (use_hints) remember_leaf(cur, slot);
       return true;
     }
 
     Key up;
     NodeId right = split_leaf(cur, pos, up);
-    remember_leaf(key < up ? cur : right);
+    if (use_hints) remember_leaf(key < up ? cur : right, slot);
 
     // Push the separator up until some ancestor has room.
     while (!path_.empty()) {
@@ -204,12 +225,11 @@ class BPlusTree {
     if (cur != kNoNode) return "leaf chain continues past the last leaf";
     // Cached fences must match the leaf exactly, or a hinted insert could
     // place a key in the wrong leaf.
-    for (const auto& h : hints_) {
-      if (h.leaf == kNoNode) continue;
-      const Node& n = node(h.leaf);
-      if (!n.leaf || n.low != h.low || n.high_inf != h.high_inf ||
-          (!n.high_inf && n.high != h.high))
-        return "stale leaf hint for node " + std::to_string(h.leaf);
+    for (std::size_t i = 0; i < hint_leaf_.size(); ++i) {
+      if (hint_leaf_[i] == kNoNode) continue;
+      const Node& n = node(hint_leaf_[i]);
+      if (!n.leaf || hint_lo_[i] != n.low || hint_span_[i] != span_of(n))
+        return "stale leaf hint for node " + std::to_string(hint_leaf_[i]);
     }
     return "";
   }
@@ -233,76 +253,93 @@ class BPlusTree {
     std::uint32_t run = 0;
   };
 
-  // A cached leaf and the key range [low, high) it owns.
-  struct Hint {
-    NodeId leaf = kNoNode;
-    Key low = 0;
-    Key high = 0;
-    bool high_inf = true;
-    std::uint64_t stamp = 0;  // LRU clock
-  };
+  static constexpr std::uint32_t kHintWindow = 64;
+  static constexpr std::uint32_t kHintSample = 16;
 
-  // Insert straight into a cached leaf whose fences contain the key. The
-  // range test is in memory; only the leaf itself is read. Gives up (and the
-  // caller descends normally) if the leaf is full, because a split needs the
-  // path to the parent.
-  bool try_hinted_insert(Key key, Value value, bool& inserted) {
-    for (auto& h : hints_) {
-      if (h.leaf == kNoNode || key < h.low || (!h.high_inf && key >= h.high)) continue;
-      Node& leaf = read(h.leaf);
-      auto pos = lower_index(leaf, key);
-      if (pos < leaf.keys.size() && leaf.keys[pos] == key) {
-        leaf.vals[pos] = value;
-        inserted = false;
-      } else {
-        if (leaf.keys.size() >= opts_.leaf_capacity) return false;
-        leaf.keys.insert(leaf.keys.begin() + pos, key);
-        leaf.vals.insert(leaf.vals.begin() + pos, value);
-        note_insert(leaf, pos);
-        ++size_;
-        inserted = true;
-      }
-      ++stats_.page_writes;
-      ++stats_.hint_hits;
-      h.stamp = ++tick_;
-      return true;
-    }
-    return false;
+  // A cached leaf owning [low, high) is stored as low and span = high-1-low,
+  // so "key in range" is the single unsigned compare key - low <= span.
+  static Key span_of(const Node& n) { return (n.high_inf ? ~Key{0} : n.high - 1) - n.low; }
+
+  // Returns the slot whose leaf owns `key`, or -1. Cached leaves have
+  // disjoint ranges, so at most one slot can match. Empty slots have
+  // low = max key and span 0 and so can only match the max key itself.
+  int probe_hints(Key key) const {
+    for (std::size_t i = 0; i < hint_lo_.size(); ++i)
+      if (key - hint_lo_[i] <= hint_span_[i] && hint_leaf_[i] != kNoNode)
+        return static_cast<int>(i);
+    return -1;
   }
 
-  // Records the leaf an insert just wrote, evicting the least recently used
-  // entry. The Rightmost policy only ever caches the rightmost leaf.
-  void remember_leaf(NodeId id) {
-    if (hints_.empty()) return;
+  // Inserts straight into the cached leaf, reading only that page. Gives up
+  // (and the caller descends normally) if the leaf is full, because a split
+  // needs the path to the parent.
+  bool hinted_insert(int slot, Key key, Value value, bool& inserted) {
+    Node& leaf = read(hint_leaf_[slot]);
+    auto pos = lower_index(leaf, key);
+    if (pos < leaf.keys.size() && leaf.keys[pos] == key) {
+      leaf.vals[pos] = value;
+      inserted = false;
+    } else {
+      if (leaf.keys.size() >= opts_.leaf_capacity) return false;
+      leaf.keys.insert(leaf.keys.begin() + pos, key);
+      leaf.vals.insert(leaf.vals.begin() + pos, value);
+      note_insert(leaf, pos);
+      ++size_;
+      inserted = true;
+    }
+    ++stats_.page_writes;
+    ++stats_.hint_hits;
+    hint_stamp_[slot] = ++tick_;
+    return true;
+  }
+
+  // Caches the leaf a slow-path insert ended in. If the probe had matched a
+  // slot (its leaf was full and has just split) that slot is reused: the
+  // leaf the stream continues in replaces the one it filled. Otherwise the
+  // least recently used slot is evicted. Rightmost caches only the rightmost
+  // leaf, like PostgreSQL.
+  void remember_leaf(NodeId id, int slot) {
     const Node& n = node(id);
     if (opts_.hints == HintPolicy::Rightmost && !n.high_inf) return;
-    Hint* victim = &hints_.front();
-    for (auto& h : hints_) {
-      if (h.leaf == id) {
-        victim = &h;
-        break;
-      }
-      if (h.stamp < victim->stamp) victim = &h;
+    std::size_t victim = 0;
+    if (slot >= 0) {
+      victim = static_cast<std::size_t>(slot);
+    } else {
+      for (std::size_t i = 1; i < hint_stamp_.size(); ++i)
+        if (hint_stamp_[i] < hint_stamp_[victim]) victim = i;
     }
-    *victim = Hint{id, n.low, n.high, n.high_inf, ++tick_};
+    hint_leaf_[victim] = id;
+    hint_lo_[victim] = n.low;
+    hint_span_[victim] = span_of(n);
+    hint_stamp_[victim] = ++tick_;
   }
 
   // A split shrinks the left leaf's range; keep any cached copy exact.
   void hints_after_split(NodeId left) {
-    for (auto& h : hints_) {
-      if (h.leaf != left) continue;
+    for (std::size_t i = 0; i < hint_leaf_.size(); ++i) {
+      if (hint_leaf_[i] != left) continue;
       if (opts_.hints == HintPolicy::Rightmost) {
-        h.leaf = kNoNode;  // no longer the rightmost leaf
+        hint_leaf_[i] = kNoNode;  // no longer the rightmost leaf
+        hint_lo_[i] = ~Key{0};
+        hint_span_[i] = 0;
       } else {
-        h.high = node(left).high;
-        h.high_inf = false;
+        hint_span_[i] = span_of(node(left));
       }
     }
   }
 
+  // Nodes are sized like fixed pages up front (one spare slot for the
+  // overflow that triggers a split), so filling a page never reallocates.
   NodeId alloc(bool leaf) {
     auto n = std::make_unique<Node>();
     n->leaf = leaf;
+    if (leaf) {
+      n->keys.reserve(opts_.leaf_capacity + 1);
+      n->vals.reserve(opts_.leaf_capacity + 1);
+    } else {
+      n->keys.reserve(opts_.inner_capacity + 1);
+      n->children.reserve(opts_.inner_capacity + 2);
+    }
     pages_.push_back(std::move(n));
     return static_cast<NodeId>(pages_.size() - 1);
   }
@@ -467,8 +504,15 @@ class BPlusTree {
   Stats stats_;
   std::vector<std::unique_ptr<Node>> pages_;
   std::vector<std::pair<NodeId, std::uint32_t>> path_;  // (inner node, child slot)
-  std::vector<Hint> hints_;
+  // Leaf hint cache, structure-of-arrays so the probe is a tight loop.
+  std::vector<Key> hint_lo_;
+  std::vector<Key> hint_span_;
+  std::vector<NodeId> hint_leaf_;
+  std::vector<std::uint64_t> hint_stamp_;  // LRU clock values
   std::uint64_t tick_ = 0;
+  bool hints_on_ = true;            // false: sampling only (see insert())
+  std::uint32_t window_probes_ = 0;
+  std::uint32_t window_hits_ = 0;
   NodeId root_ = kNoNode;
   std::uint32_t height_ = 0;
   std::uint64_t size_ = 0;
