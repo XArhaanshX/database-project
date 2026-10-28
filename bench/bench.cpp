@@ -3,7 +3,8 @@
 //
 //   bench [--n N] [--reps R] [--out DIR] [--quick]
 //
-// Writes DIR/main.csv, DIR/streams_sweep.csv and DIR/late_sweep.csv.
+// Writes DIR/main.csv, DIR/streams_sweep.csv, DIR/late_sweep.csv and
+// DIR/random_overhead.csv.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -238,6 +239,15 @@ int main(int argc, char** argv) {
     for (std::size_t v = 0; v < late_vs.size(); ++v) write_row(f, name, late_vs[v].name, n, rs[v]);
   }
   std::fclose(f);
-  std::printf("wrote %s/{main,streams_sweep,late_sweep}.csv\n", out.c_str());
+  // 4. Cost of the machinery when there is nothing to exploit: random keys,
+  // many interleaved repetitions so the comparison is not lost in noise.
+  f = std::fopen((out + "/random_overhead.csv").c_str(), "w");
+  std::fputs(kHeader, f);
+  const auto ab_vs = pick(all, {"baseline", "adaptive-split", "multi-hint", "sa-btree"});
+  auto ab = measure(ab_vs, workloads[1].keys, 3 * reps, /*probe=*/false);
+  for (std::size_t v = 0; v < ab_vs.size(); ++v) write_row(f, "random", ab_vs[v].name, n, ab[v]);
+  std::fclose(f);
+
+  std::printf("wrote %s/{main,streams_sweep,late_sweep,random_overhead}.csv\n", out.c_str());
   return 0;
 }

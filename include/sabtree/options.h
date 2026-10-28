@@ -47,8 +47,9 @@ struct Options {
   double seq_fill = 0.9;
 
   HintPolicy hints = HintPolicy::None;
-  // Multi hints: number of cached leaves. Rightmost always uses one.
-  std::uint32_t hint_slots = 16;
+  // Multi hints: number of cached leaves (about 24 bytes each). Rightmost
+  // always uses one.
+  std::uint32_t hint_slots = 64;
 };
 
 // Logical I/O counters. A "page read" is one node visited by an operation;
