@@ -43,11 +43,27 @@ std::vector<Config> configs(std::uint32_t leaf_cap, std::uint32_t inner_cap) {
   adaptive90.seq_fill = 0.9;
   Options eager = adaptive;
   eager.run_threshold = 0;  // every split is treated as part of a run
+  Options rightmost = base;
+  rightmost.hints = HintPolicy::Rightmost;
+  Options multi = base;
+  multi.hints = HintPolicy::Multi;
+  multi.hint_slots = 4;
+  Options one_slot = multi;
+  one_slot.hint_slots = 1;
+  Options ours = adaptive;
+  ours.hints = HintPolicy::Multi;
+  Options ours90 = ours;
+  ours90.seq_fill = 0.9;
   return {{"middle", base},
           {"insert-point", insert_point},
           {"adaptive", adaptive},
           {"adaptive-f90", adaptive90},
-          {"adaptive-eager", eager}};
+          {"adaptive-eager", eager},
+          {"rightmost-hint", rightmost},
+          {"multi-hint", multi},
+          {"multi-hint-1", one_slot},
+          {"adaptive+multi", ours},
+          {"adaptive-f90+multi", ours90}};
 }
 
 // Inserts `keys` in order, checking against a std::map every `every` steps.
@@ -223,6 +239,65 @@ void test_streams_keep_pages_full() {
   EXPECT(b.shape().leaf_fill > a.shape().leaf_fill, "adaptive beats insert-point on streams");
 }
 
+void test_hints_skip_descent() {
+  Options o;
+  o.leaf_capacity = 64;
+  o.inner_capacity = 64;
+  o.split = SplitPolicy::Adaptive;
+  BPlusTree plain(o);
+  o.hints = HintPolicy::Rightmost;
+  BPlusTree rightmost(o);
+  o.hints = HintPolicy::Multi;
+  o.hint_slots = 16;
+  BPlusTree multi(o);
+
+  for (Key k = 0; k < 100000; ++k) {
+    plain.insert(k, k);
+    rightmost.insert(k, k);
+    multi.insert(k, k);
+  }
+  const double n = 100000;
+  EXPECT(plain.stats().page_reads / n > 2.5, "plain inserts descend the whole tree");
+  EXPECT(rightmost.stats().page_reads / n < 1.1, "rightmost hint serves appends");
+  EXPECT(multi.stats().page_reads / n < 1.1, "multi hint serves appends");
+
+  // Eight interleaved streams: one rightmost slot cannot cover them, 16 can.
+  BPlusTree r8(rightmost.options()), m8(multi.options());
+  for (Key k : stream_keys(100000, 8, 3)) {
+    r8.insert(k, k);
+    m8.insert(k, k);
+  }
+  EXPECT(m8.stats().hint_hits > 0.9 * n, "multi hint covers 8 streams");
+  EXPECT(r8.stats().hint_hits < 0.2 * n, "rightmost hint only covers the last stream");
+  EXPECT(m8.check().empty(), "multi-hint tree invariants");
+}
+
+void test_hint_survives_overwrites_and_erases() {
+  Options o;
+  o.leaf_capacity = 4;
+  o.inner_capacity = 4;
+  o.split = SplitPolicy::Adaptive;
+  o.hints = HintPolicy::Multi;
+  o.hint_slots = 2;
+  BPlusTree t(o);
+  std::map<Key, Value> ref;
+  for (Key k = 0; k < 2000; ++k) {
+    t.insert(k * 2, k);
+    ref[k * 2] = k;
+    if (k % 3 == 0) {
+      t.insert(k, 7);  // overwrite or fill a gap behind the hinted leaf
+      ref[k] = 7;
+    }
+    if (k % 5 == 0) {
+      t.erase(k);
+      ref.erase(k);
+    }
+  }
+  auto err = t.check();
+  EXPECT(err.empty(), err.c_str());
+  for (const auto& [k, v] : ref) EXPECT(t.find(k) == v, "lookup after hinted writes");
+}
+
 }  // namespace
 
 int main() {
@@ -234,6 +309,8 @@ int main() {
       {"sequential_page_reads", test_sequential_page_reads},
       {"adaptive_split_fills_pages", test_adaptive_split_fills_pages},
       {"streams_keep_pages_full", test_streams_keep_pages_full},
+      {"hints_skip_descent", test_hints_skip_descent},
+      {"hint_survives_overwrites_and_erases", test_hint_survives_overwrites_and_erases},
   };
   for (const auto& [name, fn] : tests) {
     int before = g_failures;
