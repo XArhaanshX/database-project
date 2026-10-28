@@ -95,6 +95,54 @@ class BPlusTree {
     return std::nullopt;
   }
 
+  // Calls fn(key, value) for every key in [lo, hi], in order. Returns the
+  // number of entries visited.
+  template <typename Fn>
+  std::uint64_t scan(Key lo, Key hi, Fn&& fn) {
+    if (root_ == kNoNode || lo > hi) return 0;
+    NodeId cur = root_;
+    for (;;) {
+      Node& n = read(cur);
+      if (n.leaf) break;
+      cur = n.children[child_index(n, lo)];
+    }
+    std::uint64_t visited = 0;
+    auto pos = lower_index(node(cur), lo);
+    for (;;) {
+      const Node& leaf = node(cur);
+      for (; pos < leaf.keys.size(); ++pos) {
+        if (leaf.keys[pos] > hi) return visited;
+        fn(leaf.keys[pos], leaf.vals[pos]);
+        ++visited;
+      }
+      if (leaf.next == kNoNode) return visited;
+      cur = leaf.next;
+      read(cur);
+      pos = 0;
+    }
+  }
+
+  // Removes a key. Nodes are never merged: a leaf that drains stays in the
+  // tree with its key range, which is also what PostgreSQL does until VACUUM
+  // reclaims it. Returns false if the key was absent.
+  bool erase(Key key) {
+    if (root_ == kNoNode) return false;
+    NodeId cur = root_;
+    for (;;) {
+      Node& n = read(cur);
+      if (n.leaf) break;
+      cur = n.children[child_index(n, key)];
+    }
+    Node& leaf = node(cur);
+    auto pos = lower_index(leaf, key);
+    if (pos == leaf.keys.size() || leaf.keys[pos] != key) return false;
+    leaf.keys.erase(leaf.keys.begin() + pos);
+    leaf.vals.erase(leaf.vals.begin() + pos);
+    ++stats_.page_writes;
+    --size_;
+    return true;
+  }
+
   std::uint64_t size() const { return size_; }
   std::uint32_t height() const { return height_; }
   const Options& options() const { return opts_; }
