@@ -254,7 +254,7 @@ class BPlusTree {
   };
 
   static constexpr std::uint32_t kHintWindow = 64;
-  static constexpr std::uint32_t kHintSample = 16;
+  static constexpr std::uint32_t kHintSample = 64;
 
   // A cached leaf owning [low, high) is stored as low and span = high-1-low,
   // so "key in range" is the single unsigned compare key - low <= span.
