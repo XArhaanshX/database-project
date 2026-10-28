@@ -58,7 +58,7 @@ struct Workload {
 };
 
 struct Result {
-  double insert_ns = 0;  // median over timed reps, after one untimed warm-up
+  double insert_ns = 0;  // best of the timed reps, after one untimed warm-up
   Stats stats;
   Shape shape;
   double lookup_reads = 0, lookup_ns = 0;
@@ -69,51 +69,72 @@ double seconds_since(Clock::time_point t0) {
   return std::chrono::duration<double>(Clock::now() - t0).count();
 }
 
+// Timing noise on a desktop machine (frequency changes, background load)
+// only ever adds time, so the fastest repetition is the robust estimate.
+double best(const std::vector<double>& v) { return *std::min_element(v.begin(), v.end()); }
+
 volatile std::uint64_t g_sink;  // keeps lookups from being optimised away
 
-Result measure(const Options& opts, const std::vector<Key>& keys, int reps, bool probe) {
-  Result r;
+// Lookup and range-scan costs on a built tree.
+void probe_reads(BPlusTree& t, const std::vector<Key>& keys, Result& r) {
+  SplitMix64 rng(42);
+  const std::size_t lookups = std::min<std::size_t>(200000, keys.size());
+  std::vector<Key> probes(lookups);
+  for (auto& k : probes) k = keys[rng.below(keys.size())];
+  std::uint64_t sum = 0;
   std::vector<double> times;
-  for (int rep = -1; rep < reps; ++rep) {
-    BPlusTree t(opts);
+  for (int pass = 0; pass < 3; ++pass) {
+    t.reset_stats();
     auto t0 = Clock::now();
-    for (std::size_t i = 0; i < keys.size(); ++i) t.insert(keys[i], i);
-    if (rep < 0) continue;  // warm-up: first touch of fresh memory
-    times.push_back(seconds_since(t0) * 1e9 / double(keys.size()));
-    if (rep + 1 < reps) continue;
-
-    r.stats = t.stats();
-    r.shape = t.shape();
-    if (!probe) break;
-
-    // Point lookups of existing keys in random order.
-    SplitMix64 rng(42);
-    const std::size_t lookups = std::min<std::size_t>(200000, keys.size());
-    std::vector<Key> probes(lookups);
-    for (auto& k : probes) k = keys[rng.below(keys.size())];
-    t.reset_stats();
-    std::uint64_t sum = 0;
-    t0 = Clock::now();
     for (Key k : probes) sum += t.find(k).value_or(0);
-    r.lookup_ns = seconds_since(t0) * 1e9 / double(lookups);
-    r.lookup_reads = double(t.stats().page_reads) / double(lookups);
-    g_sink = sum;
-
-    // Range scans returning 1000 consecutive entries each.
-    std::vector<Key> sorted = keys;
-    std::sort(sorted.begin(), sorted.end());
-    const std::size_t scans = 2000, len = 1000;
-    t.reset_stats();
-    for (std::size_t i = 0; i < scans; ++i) {
-      std::size_t at = rng.below(sorted.size() - len);
-      t.scan(sorted[at], sorted[at + len - 1], [&](Key, Value v) { sum += v; });
-    }
-    r.scan_reads = double(t.stats().page_reads) / double(scans);
-    g_sink = sum;
+    times.push_back(seconds_since(t0) * 1e9 / double(lookups));
   }
-  std::sort(times.begin(), times.end());
-  r.insert_ns = times[times.size() / 2];
-  return r;
+  r.lookup_ns = best(times);
+  r.lookup_reads = double(t.stats().page_reads) / double(lookups);
+
+  // Range scans returning 1000 consecutive entries each.
+  std::vector<Key> sorted = keys;
+  std::sort(sorted.begin(), sorted.end());
+  const std::size_t scans = 2000, len = 1000;
+  t.reset_stats();
+  for (std::size_t i = 0; i < scans; ++i) {
+    std::size_t at = rng.below(sorted.size() - len);
+    t.scan(sorted[at], sorted[at + len - 1], [&](Key, Value v) { sum += v; });
+  }
+  r.scan_reads = double(t.stats().page_reads) / double(scans);
+  g_sink = sum;
+}
+
+// Builds every variant on `keys`. Repetitions are interleaved across the
+// variants (rep 1 of all, then rep 2 of all, ...) so that slow drift in
+// clock speed or background load affects every variant alike.
+std::vector<Result> measure(const std::vector<Variant>& vs, const std::vector<Key>& keys,
+                            int reps, bool probe) {
+  std::vector<Result> out(vs.size());
+  std::vector<std::vector<double>> times(vs.size());
+  for (int rep = -1; rep < reps; ++rep) {
+    for (std::size_t v = 0; v < vs.size(); ++v) {
+      BPlusTree t(vs[v].opts);
+      auto t0 = Clock::now();
+      for (std::size_t i = 0; i < keys.size(); ++i) t.insert(keys[i], i);
+      if (rep < 0) continue;  // warm-up round: first touch of fresh memory
+      times[v].push_back(seconds_since(t0) * 1e9 / double(keys.size()));
+      if (rep + 1 < reps) continue;
+      out[v].stats = t.stats();
+      out[v].shape = t.shape();
+      if (probe) probe_reads(t, keys, out[v]);
+    }
+  }
+  for (std::size_t v = 0; v < vs.size(); ++v) out[v].insert_ns = best(times[v]);
+  return out;
+}
+
+std::vector<Variant> pick(const std::vector<Variant>& vs, const std::vector<std::string>& names) {
+  std::vector<Variant> out;
+  for (const auto& name : names)
+    for (const auto& v : vs)
+      if (v.name == name) out.push_back(v);
+  return out;
 }
 
 const char* kHeader =
@@ -142,7 +163,7 @@ void write_row(std::FILE* f, const std::string& workload, const std::string& var
 
 int main(int argc, char** argv) {
   std::size_t n = 2'000'000;
-  int reps = 5;
+  int reps = 7;
   std::string out = "results";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--n") && i + 1 < argc) {
@@ -168,7 +189,7 @@ int main(int argc, char** argv) {
       {"streams-64", stream_keys(n, 64, seed)},
       {"nearly-sorted", nearly_sorted_keys(n, 0.05, 1000, seed)},
   };
-  const auto vs = variants();
+  const auto all = variants();
 
   // 1. Every variant on every workload.
   std::FILE* f = std::fopen((out + "/main.csv").c_str(), "w");
@@ -179,47 +200,42 @@ int main(int argc, char** argv) {
   std::fputs(kHeader, f);
   std::printf("%-14s %-24s %9s %8s %7s %7s %9s\n", "workload", "variant", "ns/ins", "rd/ins",
               "fill", "MiB", "scan-rd");
+  const auto main_vs = pick(all, {"baseline", "rightmost", "insert-point", "rightmost+insert-point",
+                                  "adaptive-split", "multi-hint", "sa-btree", "sa-btree-f100"});
   for (const auto& w : workloads) {
-    for (const auto& v : vs) {
-      if (v.name == "sa-btree-64slots") continue;  // sweep only
-      Result r = measure(v.opts, w.keys, reps, /*probe=*/true);
-      write_row(f, w.name, v.name, n, r);
+    auto rs = measure(main_vs, w.keys, reps, /*probe=*/true);
+    for (std::size_t v = 0; v < main_vs.size(); ++v) {
+      const Result& r = rs[v];
+      write_row(f, w.name, main_vs[v].name, n, r);
       std::printf("%-14s %-24s %9.1f %8.3f %7.3f %7.1f %9.1f\n", w.name.c_str(),
-                  v.name.c_str(), r.insert_ns, double(r.stats.page_reads) / double(n),
-                  r.shape.leaf_fill, double(r.shape.leaves + r.shape.inners) * 4096.0 / 1048576.0,
-                  r.scan_reads);
+                  main_vs[v].name.c_str(), r.insert_ns, double(r.stats.page_reads) / double(n),
+                  r.shape.leaf_fill,
+                  double(r.shape.leaves + r.shape.inners) * 4096.0 / 1048576.0, r.scan_reads);
     }
   }
   std::fclose(f);
 
-  // 2. Number of interleaved streams vs. a fixed 16-slot hint cache.
+  // 2. Number of interleaved streams vs. the hint cache size.
   f = std::fopen((out + "/streams_sweep.csv").c_str(), "w");
   std::fputs(kHeader, f);
+  const auto stream_vs = pick(all, {"baseline", "rightmost+insert-point", "adaptive-split",
+                                    "sa-btree", "sa-btree-64slots"});
   for (std::uint32_t streams : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 1024u}) {
-    auto keys = stream_keys(n, streams, seed);
-    for (const auto& v : vs) {
-      if (v.name != "baseline" && v.name != "rightmost+insert-point" &&
-          v.name != "adaptive-split" && v.name != "sa-btree" && v.name != "sa-btree-64slots")
-        continue;
-      write_row(f, "streams-" + std::to_string(streams), v.name, n,
-                measure(v.opts, keys, std::min(reps, 3), /*probe=*/false));
-    }
+    auto rs = measure(stream_vs, stream_keys(n, streams, seed), std::min(reps, 5), false);
+    for (std::size_t v = 0; v < stream_vs.size(); ++v)
+      write_row(f, "streams-" + std::to_string(streams), stream_vs[v].name, n, rs[v]);
   }
   std::fclose(f);
 
   // 3. Share of late records vs. the adaptive split's fill limit.
   f = std::fopen((out + "/late_sweep.csv").c_str(), "w");
   std::fputs(kHeader, f);
+  const auto late_vs = pick(all, {"baseline", "rightmost+insert-point", "sa-btree", "sa-btree-f100"});
   for (double late : {0.0, 0.01, 0.02, 0.05, 0.10, 0.20}) {
-    auto keys = nearly_sorted_keys(n, late, 1000, seed);
     char name[32];
     std::snprintf(name, sizeof name, "late-%.2f", late);
-    for (const auto& v : vs) {
-      if (v.name != "baseline" && v.name != "rightmost+insert-point" && v.name != "sa-btree" &&
-          v.name != "sa-btree-f100")
-        continue;
-      write_row(f, name, v.name, n, measure(v.opts, keys, std::min(reps, 3), /*probe=*/false));
-    }
+    auto rs = measure(late_vs, nearly_sorted_keys(n, late, 1000, seed), std::min(reps, 5), false);
+    for (std::size_t v = 0; v < late_vs.size(); ++v) write_row(f, name, late_vs[v].name, n, rs[v]);
   }
   std::fclose(f);
   std::printf("wrote %s/{main,streams_sweep,late_sweep}.csv\n", out.c_str());
